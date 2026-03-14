@@ -16,8 +16,13 @@ import type {
   ContextEngine,
   ContextEngineInfo,
   AssembleResult,
+  BootstrapResult,
   CompactResult,
+  ContextEngineRuntimeContext,
+  IngestBatchResult,
   IngestResult,
+  SubagentEndReason,
+  SubagentSpawnPreparation,
 } from "./types.js";
 
 vi.mock("../agents/pi-embedded-runner/compact.runtime.js", () => ({
@@ -368,6 +373,309 @@ describe("LegacyContextEngine parity", () => {
 
   it("dispose() completes without error", async () => {
     const engine = new LegacyContextEngine();
+    await expect(engine.dispose()).resolves.toBeUndefined();
+  });
+
+  it("afterTurn() is a no-op and resolves without error", async () => {
+    const engine = new LegacyContextEngine();
+    const msgs = [makeMockMessage("user", "hi"), makeMockMessage("assistant", "hello back")];
+    await expect(
+      engine.afterTurn({
+        sessionId: "s1",
+        sessionFile: "/tmp/session.json",
+        messages: msgs,
+        prePromptMessageCount: 1,
+      }),
+    ).resolves.toBeUndefined();
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 5a. Complete lifecycle hooks
+//
+// Validates that all hooks in the Bootstrap->ingest->assemble->compact->
+// afterTurn->onSubagentEnded lifecycle are callable with correct signatures
+// and return the expected result shapes.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * A full-lifecycle engine that implements every optional hook in the
+ * ContextEngine interface.  Used as a reference for plugin authors.
+ */
+class FullLifecycleEngine implements ContextEngine {
+  readonly info: ContextEngineInfo = {
+    id: "full-lifecycle",
+    name: "Full Lifecycle Engine",
+    version: "1.0.0",
+    ownsCompaction: true,
+  };
+
+  async bootstrap(_params: {
+    sessionId: string;
+    sessionKey?: string;
+    sessionFile: string;
+  }): Promise<BootstrapResult> {
+    return { bootstrapped: true, importedMessages: 3 };
+  }
+
+  async ingest(_params: {
+    sessionId: string;
+    sessionKey?: string;
+    message: AgentMessage;
+    isHeartbeat?: boolean;
+  }): Promise<IngestResult> {
+    return { ingested: true };
+  }
+
+  async ingestBatch(params: {
+    sessionId: string;
+    sessionKey?: string;
+    messages: AgentMessage[];
+    isHeartbeat?: boolean;
+  }): Promise<IngestBatchResult> {
+    return { ingestedCount: params.messages.length };
+  }
+
+  async assemble(params: {
+    sessionId: string;
+    sessionKey?: string;
+    messages: AgentMessage[];
+    tokenBudget?: number;
+  }): Promise<AssembleResult> {
+    return { messages: params.messages, estimatedTokens: params.messages.length * 10 };
+  }
+
+  async compact(_params: {
+    sessionId: string;
+    sessionKey?: string;
+    sessionFile: string;
+    tokenBudget?: number;
+    force?: boolean;
+    currentTokenCount?: number;
+    compactionTarget?: "budget" | "threshold";
+    customInstructions?: string;
+    runtimeContext?: ContextEngineRuntimeContext;
+  }): Promise<CompactResult> {
+    return {
+      ok: true,
+      compacted: true,
+      result: { tokensBefore: 200, tokensAfter: 80, summary: "compacted" },
+    };
+  }
+
+  async afterTurn(_params: {
+    sessionId: string;
+    sessionKey?: string;
+    sessionFile: string;
+    messages: AgentMessage[];
+    prePromptMessageCount: number;
+    autoCompactionSummary?: string;
+    isHeartbeat?: boolean;
+    tokenBudget?: number;
+    runtimeContext?: ContextEngineRuntimeContext;
+  }): Promise<void> {
+    // persist canonical context for the turn
+  }
+
+  async prepareSubagentSpawn(_params: {
+    parentSessionKey: string;
+    childSessionKey: string;
+    ttlMs?: number;
+  }): Promise<SubagentSpawnPreparation> {
+    return { rollback: async () => {} };
+  }
+
+  async onSubagentEnded(_params: {
+    childSessionKey: string;
+    reason: SubagentEndReason;
+  }): Promise<void> {
+    // clean up subagent context
+  }
+
+  async dispose(): Promise<void> {
+    // release resources
+  }
+}
+
+describe("Complete lifecycle hooks", () => {
+  it("bootstrap() returns BootstrapResult with bootstrapped flag", async () => {
+    const engine = new FullLifecycleEngine();
+    const result = await engine.bootstrap!({
+      sessionId: "s1",
+      sessionFile: "/tmp/session.json",
+    });
+
+    expect(result.bootstrapped).toBe(true);
+    expect(result.importedMessages).toBe(3);
+  });
+
+  it("bootstrap() result shape: optional reason field when not bootstrapped", async () => {
+    const result: BootstrapResult = { bootstrapped: false, reason: "already initialized" };
+    expect(result.bootstrapped).toBe(false);
+    expect(result.reason).toBe("already initialized");
+    expect(result.importedMessages).toBeUndefined();
+  });
+
+  it("ingestBatch() returns IngestBatchResult with ingestedCount", async () => {
+    const engine = new FullLifecycleEngine();
+    const msgs = [makeMockMessage("user", "a"), makeMockMessage("assistant", "b")];
+    const result = await engine.ingestBatch!({
+      sessionId: "s1",
+      messages: msgs,
+    });
+
+    expect(result.ingestedCount).toBe(2);
+  });
+
+  it("ingestBatch() with empty batch returns ingestedCount 0", async () => {
+    const engine = new FullLifecycleEngine();
+    const result = await engine.ingestBatch!({ sessionId: "s1", messages: [] });
+    expect(result.ingestedCount).toBe(0);
+  });
+
+  it("afterTurn() is callable and resolves without error", async () => {
+    const engine = new FullLifecycleEngine();
+    const msgs = [makeMockMessage("user", "hi"), makeMockMessage("assistant", "hello")];
+
+    await expect(
+      engine.afterTurn!({
+        sessionId: "s1",
+        sessionFile: "/tmp/session.json",
+        messages: msgs,
+        prePromptMessageCount: 1,
+        tokenBudget: 8000,
+        isHeartbeat: false,
+      }),
+    ).resolves.toBeUndefined();
+  });
+
+  it("afterTurn() accepts optional runtimeContext without error", async () => {
+    const engine = new FullLifecycleEngine();
+    const ctx: ContextEngineRuntimeContext = { workspaceDir: "/tmp/ws", customKey: 42 };
+
+    await expect(
+      engine.afterTurn!({
+        sessionId: "s1",
+        sessionFile: "/tmp/session.json",
+        messages: [makeMockMessage()],
+        prePromptMessageCount: 0,
+        runtimeContext: ctx,
+      }),
+    ).resolves.toBeUndefined();
+  });
+
+  it("prepareSubagentSpawn() returns a rollback handle", async () => {
+    const engine = new FullLifecycleEngine();
+    const prep = await engine.prepareSubagentSpawn!({
+      parentSessionKey: "parent",
+      childSessionKey: "child",
+      ttlMs: 60_000,
+    });
+
+    expect(prep).toBeDefined();
+    expect(typeof prep!.rollback).toBe("function");
+    // rollback must be callable
+    await expect(prep!.rollback()).resolves.toBeUndefined();
+  });
+
+  it("onSubagentEnded() is callable for all SubagentEndReason values", async () => {
+    const engine = new FullLifecycleEngine();
+    const reasons: SubagentEndReason[] = ["deleted", "completed", "swept", "released"];
+
+    for (const reason of reasons) {
+      await expect(
+        engine.onSubagentEnded!({ childSessionKey: "child-key", reason }),
+      ).resolves.toBeUndefined();
+    }
+  });
+
+  it("compact() with runtimeContext passes context through correctly", async () => {
+    const engine = new FullLifecycleEngine();
+    const ctx: ContextEngineRuntimeContext = { workspaceDir: "/tmp", currentTokenCount: 500 };
+    const result = await engine.compact({
+      sessionId: "s1",
+      sessionFile: "/tmp/session.json",
+      runtimeContext: ctx,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.compacted).toBe(true);
+    expect(result.result?.tokensBefore).toBe(200);
+    expect(result.result?.tokensAfter).toBe(80);
+  });
+
+  it("info.ownsCompaction flag is respected", () => {
+    const engine = new FullLifecycleEngine();
+    expect(engine.info.ownsCompaction).toBe(true);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 5b. Full lifecycle integration
+//
+// Exercises the complete Bootstrap->ingest->assemble->compact->afterTurn->
+// onSubagentEnded flow as a single end-to-end sequence.
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("Full lifecycle integration", () => {
+  it("runs the complete lifecycle without error", async () => {
+    const engine = new FullLifecycleEngine();
+    const sessionId = "integration-session";
+    const sessionFile = "/tmp/integration-session.json";
+
+    // 1. Bootstrap
+    const bootstrapResult = await engine.bootstrap!({ sessionId, sessionFile });
+    expect(bootstrapResult.bootstrapped).toBe(true);
+
+    // 2. Ingest messages
+    const userMsg = makeMockMessage("user", "what is the weather?");
+    const ingestResult = await engine.ingest({ sessionId, message: userMsg });
+    expect(ingestResult.ingested).toBe(true);
+
+    const assistantMsg = makeMockMessage("assistant", "It is sunny today.");
+    const ingestResult2 = await engine.ingest({ sessionId, message: assistantMsg });
+    expect(ingestResult2.ingested).toBe(true);
+
+    // 3. Assemble context for the model
+    const assembleResult = await engine.assemble({
+      sessionId,
+      messages: [userMsg, assistantMsg],
+      tokenBudget: 4096,
+    });
+    expect(assembleResult.messages).toHaveLength(2);
+    expect(assembleResult.estimatedTokens).toBeGreaterThan(0);
+
+    // 4. Compact when approaching token limit
+    const compactResult = await engine.compact({
+      sessionId,
+      sessionFile,
+      tokenBudget: 4096,
+      currentTokenCount: 3500,
+    });
+    expect(compactResult.ok).toBe(true);
+
+    // 5. Post-turn bookkeeping
+    await expect(
+      engine.afterTurn!({
+        sessionId,
+        sessionFile,
+        messages: [userMsg, assistantMsg],
+        prePromptMessageCount: 0,
+      }),
+    ).resolves.toBeUndefined();
+
+    // 6. Subagent lifecycle
+    const prep = await engine.prepareSubagentSpawn!({
+      parentSessionKey: sessionId,
+      childSessionKey: "child-session",
+    });
+    expect(prep).toBeDefined();
+
+    await expect(
+      engine.onSubagentEnded!({ childSessionKey: "child-session", reason: "completed" }),
+    ).resolves.toBeUndefined();
+
+    // 7. Dispose
     await expect(engine.dispose()).resolves.toBeUndefined();
   });
 });

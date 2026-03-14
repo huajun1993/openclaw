@@ -4,6 +4,11 @@ export type {
   AssembleResult,
   CompactResult,
   IngestResult,
+  IngestBatchResult,
+  BootstrapResult,
+  SubagentSpawnPreparation,
+  SubagentEndReason,
+  ContextEngineRuntimeContext,
 } from "./types.js";
 
 export {

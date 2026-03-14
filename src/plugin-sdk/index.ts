@@ -796,6 +796,7 @@ export type {
   BootstrapResult,
   SubagentSpawnPreparation,
   SubagentEndReason,
+  ContextEngineRuntimeContext,
 } from "../context-engine/types.js";
 export { registerContextEngine } from "../context-engine/registry.js";
 export type { ContextEngineFactory } from "../context-engine/registry.js";
